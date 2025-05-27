@@ -1,6 +1,7 @@
 {
-  "domain": "google_generative_ai_conversation",
-  "name": "Google Generative AI",
+  "domain": "google_generative_ai_conversation_long_term_memory",
+  "name": "Google Generative AI Long Term Memory",
+  "version": "0.0.1",
   "after_dependencies": ["assist_pipeline", "intent"],
   "codeowners": ["@tronikos", "@ivanlh"],
   "config_flow": true,

@@ -7,6 +7,7 @@ from collections.abc import AsyncGenerator, Callable
 from dataclasses import replace
 from typing import Any, Literal, cast
 
+import aiohttp
 from google.genai.errors import APIError, ClientError
 from google.genai.types import (
     AutomaticFunctionCallingConfig,
@@ -363,6 +364,21 @@ class GoogleGenerativeAIConversationEntity(
         # back for HA to call.
         return tool_name if tool_name != "HasListAddItem" else "HassListAddItem"
 
+    async def _fetch_memory_data(self) -> str:
+        """Fetch memory data from the API endpoint."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get("http://localhost:6444/list_memory") as response:
+                    if response.status == 200:
+                        memory_data = await response.text()
+                        return f"\n\nCurrent Memory Data:\n{memory_data}"
+                    else:
+                        LOGGER.warning("Failed to fetch memory data: HTTP %s", response.status)
+                        return ""
+        except Exception as err:
+            LOGGER.warning("Error fetching memory data: %s", err)
+            return ""
+
     async def _async_handle_message(
         self,
         user_input: conversation.ConversationInput,
@@ -371,12 +387,17 @@ class GoogleGenerativeAIConversationEntity(
         """Call the API."""
         options = self.entry.options
 
+        # Fetch memory data and append to prompt
+        memory_data = await self._fetch_memory_data()
+        base_prompt = options.get(CONF_PROMPT, "")
+        enhanced_prompt = base_prompt + memory_data
+
         try:
             await chat_log.async_update_llm_data(
                 DOMAIN,
                 user_input,
                 options.get(CONF_LLM_HASS_API),
-                options.get(CONF_PROMPT),
+                enhanced_prompt,
             )
         except conversation.ConverseError as err:
             return err.as_conversation_result()
