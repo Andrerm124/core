@@ -46,8 +46,6 @@ from .addon import get_addon_manager
 from .const import (
     ADDON_SLUG,
     CONF_ADDON_DEVICE,
-    CONF_ADDON_EMULATE_HARDWARE,
-    CONF_ADDON_LOG_LEVEL,
     CONF_ADDON_LR_S2_ACCESS_CONTROL_KEY,
     CONF_ADDON_LR_S2_AUTHENTICATED_KEY,
     CONF_ADDON_NETWORK_KEY,
@@ -56,6 +54,7 @@ from .const import (
     CONF_ADDON_S2_AUTHENTICATED_KEY,
     CONF_ADDON_S2_UNAUTHENTICATED_KEY,
     CONF_INTEGRATION_CREATED_ADDON,
+    CONF_KEEP_OLD_DEVICES,
     CONF_LR_S2_ACCESS_CONTROL_KEY,
     CONF_LR_S2_AUTHENTICATED_KEY,
     CONF_S0_LEGACY_KEY,
@@ -77,17 +76,7 @@ TITLE = "Z-Wave JS"
 
 ADDON_SETUP_TIMEOUT = 5
 ADDON_SETUP_TIMEOUT_ROUNDS = 40
-CONF_EMULATE_HARDWARE = "emulate_hardware"
-CONF_LOG_LEVEL = "log_level"
 
-ADDON_LOG_LEVELS = {
-    "error": "Error",
-    "warn": "Warn",
-    "info": "Info",
-    "verbose": "Verbose",
-    "debug": "Debug",
-    "silly": "Silly",
-}
 ADDON_USER_INPUT_MAP = {
     CONF_ADDON_DEVICE: CONF_USB_PATH,
     CONF_ADDON_S0_LEGACY_KEY: CONF_S0_LEGACY_KEY,
@@ -96,8 +85,6 @@ ADDON_USER_INPUT_MAP = {
     CONF_ADDON_S2_UNAUTHENTICATED_KEY: CONF_S2_UNAUTHENTICATED_KEY,
     CONF_ADDON_LR_S2_ACCESS_CONTROL_KEY: CONF_LR_S2_ACCESS_CONTROL_KEY,
     CONF_ADDON_LR_S2_AUTHENTICATED_KEY: CONF_LR_S2_AUTHENTICATED_KEY,
-    CONF_ADDON_LOG_LEVEL: CONF_LOG_LEVEL,
-    CONF_ADDON_EMULATE_HARDWARE: CONF_EMULATE_HARDWARE,
 }
 
 ON_SUPERVISOR_SCHEMA = vol.Schema({vol.Optional(CONF_USE_ADDON, default=True): bool})
@@ -151,13 +138,15 @@ def get_usb_ports() -> dict[str, str]:
         )
         port_descriptions[dev_path] = human_name
 
-    # Sort the dictionary by description, putting "n/a" last
-    return dict(
-        sorted(
-            port_descriptions.items(),
-            key=lambda x: x[1].lower().startswith("n/a"),
-        )
-    )
+    # Filter out "n/a" descriptions only if there are other ports available
+    non_na_ports = {
+        path: desc
+        for path, desc in port_descriptions.items()
+        if not desc.lower().startswith("n/a")
+    }
+
+    # If we have non-"n/a" ports, return only those; otherwise return all ports as-is
+    return non_na_ports if non_na_ports else port_descriptions
 
 
 async def async_get_usb_ports(hass: HomeAssistant) -> dict[str, str]:
@@ -1096,10 +1085,6 @@ class ZWaveJSConfigFlow(ConfigFlow, domain=DOMAIN):
                 CONF_ADDON_S2_UNAUTHENTICATED_KEY: self.s2_unauthenticated_key,
                 CONF_ADDON_LR_S2_ACCESS_CONTROL_KEY: self.lr_s2_access_control_key,
                 CONF_ADDON_LR_S2_AUTHENTICATED_KEY: self.lr_s2_authenticated_key,
-                CONF_ADDON_LOG_LEVEL: user_input[CONF_LOG_LEVEL],
-                CONF_ADDON_EMULATE_HARDWARE: user_input.get(
-                    CONF_EMULATE_HARDWARE, False
-                ),
             }
 
             await self._async_set_addon_config(addon_config_updates)
@@ -1134,8 +1119,6 @@ class ZWaveJSConfigFlow(ConfigFlow, domain=DOMAIN):
         lr_s2_authenticated_key = addon_config.get(
             CONF_ADDON_LR_S2_AUTHENTICATED_KEY, self.lr_s2_authenticated_key or ""
         )
-        log_level = addon_config.get(CONF_ADDON_LOG_LEVEL, "info")
-        emulate_hardware = addon_config.get(CONF_ADDON_EMULATE_HARDWARE, False)
 
         try:
             ports = await async_get_usb_ports(self.hass)
@@ -1162,10 +1145,6 @@ class ZWaveJSConfigFlow(ConfigFlow, domain=DOMAIN):
                 vol.Optional(
                     CONF_LR_S2_AUTHENTICATED_KEY, default=lr_s2_authenticated_key
                 ): str,
-                vol.Optional(CONF_LOG_LEVEL, default=log_level): vol.In(
-                    ADDON_LOG_LEVELS
-                ),
-                vol.Optional(CONF_EMULATE_HARDWARE, default=emulate_hardware): bool,
             }
         )
 
@@ -1383,8 +1362,19 @@ class ZWaveJSConfigFlow(ConfigFlow, domain=DOMAIN):
         config_entry = self._reconfigure_config_entry
         assert config_entry is not None
 
+        # Make sure we keep the old devices
+        # so that user customizations are not lost,
+        # when loading the config entry.
+        self.hass.config_entries.async_update_entry(
+            config_entry, data=config_entry.data | {CONF_KEEP_OLD_DEVICES: True}
+        )
+
         # Reload the config entry to reconnect the client after the addon restart
         await self.hass.config_entries.async_reload(config_entry.entry_id)
+
+        data = config_entry.data.copy()
+        data.pop(CONF_KEEP_OLD_DEVICES, None)
+        self.hass.config_entries.async_update_entry(config_entry, data=data)
 
         @callback
         def forward_progress(event: dict) -> None:
@@ -1412,7 +1402,9 @@ class ZWaveJSConfigFlow(ConfigFlow, domain=DOMAIN):
             driver.once("driver ready", set_driver_ready),
         ]
         try:
-            await controller.async_restore_nvm(self.backup_data)
+            await controller.async_restore_nvm(
+                self.backup_data, {"preserveRoutes": False}
+            )
         except FailedCommand as err:
             raise AbortFlow(f"Failed to restore network: {err}") from err
         else:
@@ -1436,6 +1428,15 @@ class ZWaveJSConfigFlow(ConfigFlow, domain=DOMAIN):
                     config_entry, unique_id=str(version_info.home_id)
                 )
             await self.hass.config_entries.async_reload(config_entry.entry_id)
+
+            # Reload the config entry two times to clean up
+            # the stale device entry.
+            # Since both the old and the new controller have the same node id,
+            # but different hardware identifiers, the integration
+            # will create a new device for the new controller, on the first reload,
+            # but not immediately remove the old device.
+            await self.hass.config_entries.async_reload(config_entry.entry_id)
+
         finally:
             for unsub in unsubs:
                 unsub()
